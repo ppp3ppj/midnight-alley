@@ -295,6 +295,15 @@ fn draw_food(tex: &Texture2D, x: f32, y: f32) {
     );
 }
 
+fn draw_button(rect: Rect, label: &str, hovered: bool) {
+    let fill = if hovered { Color::from_rgba(200, 80, 60, 255) } else { Color::from_rgba(140, 50, 40, 255) };
+    draw_rectangle(rect.x + 2.0, rect.y + 3.0, rect.w, rect.h, Color::new(0.0, 0.0, 0.0, 0.35)); // shadow
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, fill);
+    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, 2.0, WHITE);
+    let dims = measure_text(label, None, 22, 1.0);
+    draw_text(label, rect.x + (rect.w - dims.width) / 2.0, rect.y + (rect.h + dims.height) / 2.0 - 1.0, 22.0, WHITE);
+}
+
 fn draw_centered(msg: &str, y: f32, size: u16, color: Color) {
     let dims = measure_text(msg, None, size, 1.0);
     draw_text(msg, (screen_width() - dims.width) / 2.0, y, size as f32, color);
@@ -335,9 +344,14 @@ async fn main() {
             got_snapshot = true;
         }
 
-        // --- the kind old lady (you) drops food ---
-        if is_mouse_button_pressed(MouseButton::Left) {
-            let (mx, _) = mouse_position();
+        // --- Reset button (top right, under the moon) or R: start a new colony ---
+        let reset_btn = Rect::new(sw - 130.0, 100.0, 110.0, 34.0);
+        let (mx, my) = mouse_position();
+        let over_reset = reset_btn.contains(vec2(mx, my));
+        if is_key_pressed(KeyCode::R) || (over_reset && is_mouse_button_pressed(MouseButton::Left)) {
+            net.send(r#"{"type":"reset"}"#);
+        // --- the kind old lady (you) drops food (a click on the button doesn't) ---
+        } else if is_mouse_button_pressed(MouseButton::Left) {
             net.send(&format!(r#"{{"type":"drop","x":{}}}"#, mx / sw * WORLD_W));
         }
         // B: break / fix the shared state (STM off / on)
@@ -434,6 +448,7 @@ async fn main() {
 
         // --- HUD ---
         let ink = if daylight > 0.5 { BLACK } else { WHITE };
+        draw_button(reset_btn, "Reset (R)", over_reset);
         if !got_snapshot {
             draw_centered("Connecting to the Clojure server...", screen_height() / 2.0, 36, WHITE);
             draw_centered(&format!("(start it with `lein run` in server/, expecting {})", Net::server()), screen_height() / 2.0 + 34.0, 22, LIGHTGRAY);
