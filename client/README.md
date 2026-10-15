@@ -2,6 +2,22 @@
 
 A [macroquad](https://github.com/not-fl3/macroquad) game client, compiled to WebAssembly.
 
+## Assets
+
+```
+assets/
+  tiles/  farm_tilemap.png      ground, hay-bale roofs, greenhouse, pumpkins, sunflowers (18px tiles, 16 columns)
+  rat/    rat_sheet.png         3 frames of 64x64: walk A, walk B, rest (art faces left)
+  food/   snail_shell.png       the food the player drops
+  _source/                      original SVGs the PNGs were rendered from
+```
+
+## Credits
+
+- **Tiles:** [Pixel Platformer: Farm Expansion](https://kenney.nl/assets/pixel-platformer-farm-expansion) by [Kenney](https://kenney.nl), licensed CC0 (see `assets/tiles/farm_tilemap_LICENSE.txt`).
+- **Rat and snail-shell art:** [New Platformer Pack](https://kenney.nl/assets/new-platformer-pack) (1.1) by [Kenney](https://kenney.nl), licensed CC0. The mouse and snail-shell SVGs are in `assets/_source/`; the PNGs are rendered from them.
+- Built with [macroquad](https://github.com/not-fl3/macroquad).
+
 ## Build and run
 
 ```sh
@@ -14,7 +30,7 @@ cargo install basic-http-server
 basic-http-server -a 0.0.0.0:4000 .
 ```
 
-Open `http://localhost:4000` and you should see orange cats wandering in the dark.
+Open `http://localhost:4000` and you should see rats wandering through the alley at night. Click to drop food.
 
 ### Running under WSL
 
