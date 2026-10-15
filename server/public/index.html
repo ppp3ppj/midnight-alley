@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Midnight Alley</title>
+<style>html,body,canvas{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:black}</style>
+</head>
+<body>
+<canvas id="glcanvas" tabindex="1"></canvas>
+<!-- served by the Clojure server; plugins must load after the bundle and before the wasm -->
+<script src="js/mq_js_bundle.js"></script>
+<script src="js/sapp_jsutils.js"></script>
+<script src="js/quad-net.js"></script>
+<script>load("client.wasm");</script>
+</body>
+</html>

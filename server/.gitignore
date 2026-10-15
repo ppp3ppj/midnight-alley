@@ -1,0 +1,6 @@
+target/
+.lein-*
+.nrepl-port
+# build output of ../build.sh
+public/client.wasm
+public/assets/

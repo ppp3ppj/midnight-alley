@@ -40,7 +40,30 @@ assets/
 - **Rat and snail-shell art:** [New Platformer Pack](https://kenney.nl/assets/new-platformer-pack) (1.1) by [Kenney](https://kenney.nl), licensed CC0. The mouse and snail-shell SVGs are in `assets/_source/`; the PNGs are rendered from them.
 - Built with [macroquad](https://github.com/not-fl3/macroquad).
 
-## Build and run
+## Run with the server (desktop)
+
+The client only draws; the Clojure server in `../server` runs the world.
+
+```sh
+cd ../server && lein run     # terminal 1: ws://localhost:8080/ws
+cd ../client && cargo run    # terminal 2
+```
+
+Click to drop food. Press **B** to switch the server between STM on and broken mode (ghost food, two rats on one roof).
+Set `MIDNIGHT_SERVER=host:port` to use another server address. If the server isn't up yet the client waits and keeps retrying.
+
+## Build and run (browser, served by the Clojure server)
+
+```sh
+./build.sh                   # from the repo root: builds client.wasm into server/public/
+cd server && lein run        # then open http://localhost:8080
+```
+
+The server serves `index.html`, `client.wasm`, the JS plugins and `assets/` from `server/public/`,
+and the page talks back to the same server over `/ws`. Re-run `./build.sh` after changing Rust code.
+The old standalone instructions below build the wasm by hand and are only needed without the server.
+
+## Build by hand (WebAssembly)
 
 ```sh
 cargo build --release --target wasm32-unknown-unknown

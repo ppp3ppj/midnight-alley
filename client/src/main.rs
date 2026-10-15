@@ -1,6 +1,15 @@
-use macroquad::prelude::*;
+//! Midnight Alley client: draws the world the Clojure server simulates.
+//! It receives JSON snapshots over a WebSocket and sends clicks (drop food) and
+//! the B key (toggle broken mode) back.
 
-const RAT_SPEED: f32 = 60.0;
+use std::collections::HashMap;
+
+use macroquad::prelude::*;
+use quad_net::web_socket::WebSocket;
+use serde::Deserialize;
+
+// ---------------------------------------------------------------- assets
+
 // the rats use the mouse art: 3 frames of 64x64 (walk_a, walk_b, rest), facing left
 const CHAR_SHEET: &str = "assets/rat/rat_sheet.png";
 const CHAR_PX: f32 = 64.0;
@@ -10,8 +19,6 @@ const CHAR_SCALE: f32 = 0.7;
 const FOOD_SHEET: &str = "assets/food/snail_shell.png";
 const FOOD_PX: f32 = 64.0;
 const FOOD_SCALE: f32 = 0.45;
-const NIGHT_LEN: f32 = 50.0; // seconds of darkness
-const MORNING_LEN: f32 = 12.0; // seconds of light, rats go sleep
 
 // Kenney "Pixel Platformer: Farm Expansion" packed sheet: 18px tiles, 16 columns, no spacing
 const SHEET: &str = "assets/tiles/farm_tilemap.png";
@@ -29,65 +36,160 @@ const SUNFLOWER: (usize, usize) = (20, 36); // flower head, stem
 const GREENHOUSE_DARK: usize = 64; // 4x3 block starting here (rows are +16)
 const GREENHOUSE_LIT: usize = 68;
 
-#[derive(Clone, Copy, PartialEq)]
-enum State {
-    Wander,
-    Sleep(usize), // index of the roof the rat sleeps on
+// ---------------------------------------------------------------- server
+
+/// The server's x positions run 0..WORLD_W; we scale them to the window.
+const WORLD_W: f32 = 1000.0;
+
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_SERVER: &str = "127.0.0.1:8080";
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_SERVER: &str = "same-origin"; // the page's own host; see server/public/js/quad-net.js
+
+/// One snapshot from the server. Keys like "safe?" and "food-count" are Clojure style.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Snapshot {
+    #[serde(rename = "safe?")]
+    safe: bool,
+    night: u32,
+    #[serde(rename = "morning?")]
+    morning: bool,
+    daylight: f32,
+    #[serde(rename = "food-count")]
+    food_count: i64, // the server's own count: goes negative in broken mode
+    food: Vec<FoodView>,
+    roofs: Vec<RoofView>,
+    rats: Vec<RatView>,
+    diary: DiaryView,
+    events: Vec<EventView>,
 }
 
-struct Rat {
-    id: u32,
+#[derive(Deserialize, Default)]
+struct FoodView {
     x: f32,
-    dir: f32, // -1 left, +1 right
-    hunger: f32, // 0 = full, 100 = dies
-    energy: f32, // 100 = rested, low = wants to sleep
-    state: State,
-    turn_timer: f32,
-    target_roof: Option<usize>, // roof it is heading to; kept until reached or taken
 }
 
-struct Roof {
-    frac_x: f32, // centre as a fraction of screen width
-    tier: f32,   // how high above the ground
-    owner: Option<u32>, // which rat sleeps here (only one!)
+#[derive(Deserialize, Default)]
+struct RoofView {
+    x: f32,
+    tier: f32,
 }
 
-impl Roof {
-    fn rect(&self) -> Rect {
-        Rect::new(self.frac_x * screen_width() - 1.5 * T, ground_y() - self.tier * 90.0, 3.0 * T, T)
+#[derive(Deserialize, Default)]
+struct RatView {
+    id: u64,
+    x: f32,
+    dir: f32,
+    hunger: f32,
+    state: String, // "wander" | "sleep"
+    roof: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct DiaryView {
+    alive: u32,
+    born: u32,
+    eaten: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct EventView {
+    #[serde(rename = "type")]
+    kind: String,
+    x: f32,
+    roof: Option<usize>,
+}
+
+struct Net {
+    ws: Option<WebSocket>,
+    last_msg: f64,
+    last_try: f64,
+}
+
+impl Net {
+    fn new() -> Self {
+        let mut net = Net { ws: None, last_msg: 0.0, last_try: 0.0 };
+        net.try_connect();
+        net
     }
-    fn center_x(&self) -> f32 {
-        self.frac_x * screen_width()
+
+    fn server() -> String {
+        std::env::var("MIDNIGHT_SERVER").unwrap_or_else(|_| DEFAULT_SERVER.to_string())
+    }
+
+    /// The desktop WebSocket panics if nothing is listening, so check the port first.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reachable() -> bool {
+        use std::net::{TcpStream, ToSocketAddrs};
+        use std::time::Duration;
+        Self::server()
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .is_some_and(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn reachable() -> bool {
+        true
+    }
+
+    fn try_connect(&mut self) {
+        self.last_try = get_time();
+        self.last_msg = get_time();
+        self.ws = if Self::reachable() {
+            WebSocket::connect(format!("ws://{}/ws", Self::server())).ok()
+        } else {
+            None
+        };
+    }
+
+    fn connected(&self) -> bool {
+        self.ws.is_some() && get_time() - self.last_msg < 3.0
+    }
+
+    /// All snapshots that arrived since the last call, oldest first.
+    fn poll(&mut self) -> Vec<Snapshot> {
+        let mut out = Vec::new();
+        if let Some(ws) = self.ws.as_mut() {
+            while let Some(bytes) = ws.try_recv() {
+                self.last_msg = get_time();
+                match serde_json::from_slice::<Snapshot>(&bytes) {
+                    Ok(snap) => out.push(snap),
+                    Err(e) => eprintln!("bad snapshot: {e}"),
+                }
+            }
+        }
+        // nothing for a while (server down or restarted): try again every 3 seconds
+        if !self.connected() && get_time() - self.last_try > 3.0 {
+            self.try_connect();
+        }
+        out
+    }
+
+    fn send(&self, json: &str) {
+        if let Some(ws) = &self.ws {
+            if ws.connected() {
+                ws.send_text(json); // in the browser, sending before the socket is open would throw
+            }
+        }
     }
 }
+
+// ---------------------------------------------------------------- drawing
 
 /// y of the top of the grass: where rats and food stand
 fn ground_y() -> f32 {
     screen_height() - 2.0 * T
 }
 
-fn random_x() -> f32 {
-    rand::gen_range(0.0, screen_width())
+fn to_screen_x(world_x: f32) -> f32 {
+    world_x / WORLD_W * screen_width()
 }
 
-fn random_dir() -> f32 {
-    if rand::gen_range(0.0, 1.0) < 0.5 { -1.0 } else { 1.0 }
-}
-
-fn nearest(xs: &[f32], from: f32) -> Option<usize> {
-    xs.iter()
-        .enumerate()
-        .min_by(|a, b| (a.1 - from).abs().total_cmp(&(b.1 - from).abs()))
-        .map(|(i, _)| i)
-}
-
-fn nearest_free_roof(roofs: &[Roof], from: f32) -> Option<usize> {
-    roofs
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.owner.is_none())
-        .min_by(|a, b| (a.1.center_x() - from).abs().total_cmp(&(b.1.center_x() - from).abs()))
-        .map(|(i, _)| i)
+fn roof_rect(r: &RoofView) -> Rect {
+    Rect::new(to_screen_x(r.x) - 1.5 * T, ground_y() - r.tier * 90.0, 3.0 * T, T)
 }
 
 fn draw_tile(sheet: &Texture2D, idx: usize, x: f32, y: f32, tint: Color) {
@@ -105,33 +207,33 @@ fn draw_tile(sheet: &Texture2D, idx: usize, x: f32, y: f32, tint: Color) {
     );
 }
 
-fn draw_rat(tex: &Texture2D, c: &Rat, y: f32) {
+fn draw_rat(tex: &Texture2D, r: &RatView, x: f32, y: f32) {
     // normal when full, tinted red when very hungry
-    let t = (c.hunger / 100.0).clamp(0.0, 1.0);
+    let t = (r.hunger / 100.0).clamp(0.0, 1.0);
     let tint = Color::new(1.0, 1.0 - 0.6 * t, 1.0 - 0.6 * t, 1.0);
     let size = CHAR_PX * CHAR_SCALE;
 
     // frame 0/1 = walking (offset by id so rats aren't in sync), 2 = resting
-    let sleeping = matches!(c.state, State::Sleep(_));
-    let frame = if sleeping { 2 } else { ((get_time() * 6.0) as usize + c.id as usize) % 2 };
+    let sleeping = r.state == "sleep";
+    let frame = if sleeping { 2 } else { ((get_time() * 6.0) as usize + r.id as usize) % 2 };
 
     // little hop while walking, out of step between rats
-    let bob = if sleeping { 0.0 } else { ((get_time() * 14.0) as f32 + c.id as f32).sin().abs() * 3.0 };
+    let bob = if sleeping { 0.0 } else { ((get_time() * 14.0) as f32 + r.id as f32).sin().abs() * 3.0 };
 
     draw_texture_ex(
         tex,
-        (c.x - size / 2.0).round(),
+        (x - size / 2.0).round(),
         (y - size + 4.0 - bob).round(),
         tint,
         DrawTextureParams {
             dest_size: Some(vec2(size, size)),
             source: Some(Rect::new(frame as f32 * CHAR_PX, 0.0, CHAR_PX, CHAR_PX)),
-            flip_x: c.dir > 0.0, // the art faces left, so flip when walking right
+            flip_x: r.dir > 0.0, // the art faces left, so flip when walking right
             ..Default::default()
         },
     );
     if sleeping {
-        draw_text("z", c.x + size / 2.0 - 6.0, y - size + 8.0, 22.0, WHITE);
+        draw_text("z", x + size / 2.0 - 6.0, y - size + 8.0, 22.0, WHITE);
     }
 }
 
@@ -193,149 +295,68 @@ fn draw_food(tex: &Texture2D, x: f32, y: f32) {
     );
 }
 
+fn draw_centered(msg: &str, y: f32, size: u16, color: Color) {
+    let dims = measure_text(msg, None, size, 1.0);
+    draw_text(msg, (screen_width() - dims.width) / 2.0, y, size as f32, color);
+}
+
+// ---------------------------------------------------------------- main
+
 #[macroquad::main("Midnight Alley")]
 async fn main() {
     rand::srand(macroquad::miniquad::date::now() as u64);
 
     let sheet = load_texture(SHEET).await.expect("could not load farm_tilemap.png");
     sheet.set_filter(FilterMode::Nearest); // crisp pixels
-
     let char_tex = load_texture(CHAR_SHEET).await.expect("could not load rat_sheet.png");
     char_tex.set_filter(FilterMode::Linear); // the art is vector, smooth is fine
     let food_tex = load_texture(FOOD_SHEET).await.expect("could not load snail_shell.png");
     food_tex.set_filter(FilterMode::Linear);
 
-    let mut rats: Vec<Rat> = (0..30)
-        .map(|id| Rat {
-            id,
-            x: random_x(),
-            dir: random_dir(),
-            hunger: rand::gen_range(0.0, 40.0),
-            energy: rand::gen_range(50.0, 100.0),
-            state: State::Wander,
-            turn_timer: 0.0,
-            target_roof: None,
-        })
-        .collect();
-
-    let mut food: Vec<f32> = Vec::new(); // x positions on the ground; only the player adds food
-
-    let mut roofs: Vec<Roof> = [(0.12, 1.0), (0.38, 2.0), (0.62, 1.0), (0.88, 2.0)]
-        .iter()
-        .map(|&(frac_x, tier)| Roof { frac_x, tier, owner: None })
-        .collect();
-
+    let mut net = Net::new();
+    let mut snap = Snapshot::default();
+    let mut got_snapshot = false;
+    let mut shown_x: HashMap<u64, f32> = HashMap::new(); // smoothed rat positions (snapshots are ~10 per second)
     let mut particles: Vec<Particle> = Vec::new();
-    let mut night = 1u32;
-    let mut clock = 0.0f32; // seconds into the current night or morning
-    let mut morning = false;
 
     loop {
         let dt = get_frame_time();
         let (sw, g) = (screen_width(), ground_y());
 
-        // --- night <-> morning cycle ---
-        clock += dt;
-        if !morning && clock >= NIGHT_LEN {
-            morning = true;
-            clock = 0.0;
-        } else if morning && clock >= MORNING_LEN {
-            morning = false;
-            clock = 0.0;
-            night += 1;
+        // --- take in what the server sent ---
+        for new_snap in net.poll() {
+            for ev in &new_snap.events {
+                if ev.kind == "death" {
+                    let y = ev.roof.and_then(|i| new_snap.roofs.get(i)).map_or(g, |r| roof_rect(r).y);
+                    spawn_boom(&mut particles, vec2(to_screen_x(ev.x), y - CHAR_PX * CHAR_SCALE * 0.4));
+                }
+            }
+            snap = new_snap;
+            got_snapshot = true;
         }
-        // 0 = deep night, 1 = full morning (fades in and out around dawn)
-        let daylight = if morning {
-            (1.0 - (clock - MORNING_LEN / 2.0).abs() / (MORNING_LEN / 2.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
 
         // --- the kind old lady (you) drops food ---
         if is_mouse_button_pressed(MouseButton::Left) {
             let (mx, _) = mouse_position();
-            for _ in 0..5 {
-                food.push((mx + rand::gen_range(-40.0, 40.0)).rem_euclid(sw));
-            }
+            net.send(&format!(r#"{{"type":"drop","x":{}}}"#, mx / sw * WORLD_W));
+        }
+        // B: break / fix the shared state (STM off / on)
+        if is_key_pressed(KeyCode::B) {
+            net.send(&format!(r#"{{"type":"mode","safe":{}}}"#, !snap.safe));
         }
 
-        // --- update every rat ---
-        for rat in rats.iter_mut() {
-            rat.hunger += 4.0 * dt;
-
-            if let State::Sleep(r) = rat.state {
-                rat.energy = (rat.energy + 20.0 * dt).min(100.0);
-                if rat.energy >= 100.0 && !morning {
-                    roofs[r].owner = None; // free the roof
-                    rat.state = State::Wander;
-                }
-                continue;
-            }
-
-            rat.energy -= 3.0 * dt;
-
-            if rat.hunger > 40.0 {
-                // 1. Hungry: go to the nearest food
-                if let Some(i) = nearest(&food, rat.x) {
-                    let f = food[i];
-                    if (rat.x - f).abs() < 10.0 {
-                        food.swap_remove(i); // first rat to arrive gets it
-                        rat.hunger = (rat.hunger - 50.0).max(0.0);
-                    } else {
-                        rat.dir = (f - rat.x).signum();
-                    }
-                } else {
-                    // no food anywhere: keep wandering instead of drifting forever
-                    rat.turn_timer -= dt;
-                    if rat.turn_timer <= 0.0 {
-                        rat.dir = random_dir();
-                        rat.turn_timer = rand::gen_range(1.0, 3.0);
-                    }
-                }
-            } else if rat.energy < 30.0 || morning {
-                // 2. Tired (or it's morning): go to the nearest free warm roof
-                // stick to the chosen roof so the rat doesn't flip-flop between two equally close ones
-                if rat.target_roof.is_some_and(|r| roofs[r].owner.is_some()) {
-                    rat.target_roof = None; // someone else took it
-                }
-                if rat.target_roof.is_none() {
-                    rat.target_roof = nearest_free_roof(&roofs, rat.x);
-                }
-                if let Some(r) = rat.target_roof {
-                    let cx = roofs[r].center_x();
-                    if (rat.x - cx).abs() < 8.0 {
-                        roofs[r].owner = Some(rat.id); // claim it, hop up
-                        rat.x = cx;
-                        rat.state = State::Sleep(r);
-                        rat.target_roof = None;
-                        continue;
-                    }
-                    rat.dir = (cx - rat.x).signum();
-                }
+        // --- smooth the rats between snapshots ---
+        shown_x.retain(|id, _| snap.rats.iter().any(|r| r.id == *id));
+        for r in &snap.rats {
+            let target = to_screen_x(r.x);
+            let x = shown_x.entry(r.id).or_insert(target);
+            // snap when sleeping or when wrapping around the edge, otherwise glide
+            if r.state == "sleep" || (*x - target).abs() > sw / 2.0 {
+                *x = target;
             } else {
-                // 3. Happy: wander and sometimes turn
-                rat.turn_timer -= dt;
-                if rat.turn_timer <= 0.0 {
-                    rat.dir = random_dir();
-                    rat.turn_timer = rand::gen_range(1.0, 3.0);
-                }
+                *x += (target - *x) * (14.0 * dt).min(1.0);
             }
-
-            rat.x = (rat.x + rat.dir * RAT_SPEED * dt).rem_euclid(sw);
         }
-
-        // --- rats that starve leave the alley (and free their roof) ---
-        for rat in rats.iter().filter(|c| c.hunger >= 100.0) {
-            let y = match rat.state {
-                State::Sleep(r) => {
-                    roofs[r].owner = None;
-                    roofs[r].rect().y
-                }
-                State::Wander => g,
-            };
-            spawn_boom(&mut particles, vec2(rat.x, y - CHAR_PX * CHAR_SCALE * 0.4));
-        }
-        rats.retain(|c| c.hunger < 100.0);
 
         for p in particles.iter_mut() {
             p.life -= dt;
@@ -345,6 +366,7 @@ async fn main() {
         particles.retain(|p| p.life > 0.0);
 
         // --- draw ---
+        let daylight = snap.daylight.clamp(0.0, 1.0);
         // sky: deep night blue -> light gray morning
         let (nr, ng, nb) = (15.0, 20.0, 45.0);
         let (dr, dg, db) = (200.0, 200.0, 205.0);
@@ -388,40 +410,61 @@ async fn main() {
         }
 
         // warm hay-bale roofs
-        for r in &roofs {
-            let rc = r.rect();
+        for r in &snap.roofs {
+            let rc = roof_rect(r);
             for (k, idx) in HAY.iter().enumerate() {
                 draw_tile(&sheet, *idx, rc.x + k as f32 * T, rc.y, tint);
             }
         }
 
-        for &f in &food {
-            draw_food(&food_tex, f, g);
+        for f in &snap.food {
+            draw_food(&food_tex, to_screen_x(f.x), g);
         }
-        for c in &rats {
-            let y = match c.state {
-                State::Sleep(r) => roofs[r].rect().y,
-                State::Wander => g,
+        for r in &snap.rats {
+            let x = shown_x.get(&r.id).copied().unwrap_or_else(|| to_screen_x(r.x));
+            let y = match (r.state.as_str(), r.roof.and_then(|i| snap.roofs.get(i))) {
+                ("sleep", Some(roof)) => roof_rect(roof).y,
+                _ => g,
             };
-            draw_rat(&char_tex, c, y);
+            draw_rat(&char_tex, r, x, y);
         }
         for p in &particles {
             draw_particle(p);
         }
 
-        let hud = format!(
-            "Night {}{}   Rats: {}   Food: {}   (click to drop food)",
-            night,
-            if morning { " (morning)" } else { "" },
-            rats.len(),
-            food.len()
-        );
-        draw_text(&hud, 10.0, 24.0, 24.0, if daylight > 0.5 { BLACK } else { WHITE });
+        // --- HUD ---
+        let ink = if daylight > 0.5 { BLACK } else { WHITE };
+        if !got_snapshot {
+            draw_centered("Connecting to the Clojure server...", screen_height() / 2.0, 36, WHITE);
+            draw_centered(&format!("(start it with `lein run` in server/, expecting {})", Net::server()), screen_height() / 2.0 + 34.0, 22, LIGHTGRAY);
+        } else {
+            let hud = format!(
+                "Night {}{}   Rats: {}   Pups born: {}   Food eaten: {}   (click to drop food)",
+                snap.night,
+                if snap.morning { " (morning)" } else { "" },
+                snap.diary.alive,
+                snap.diary.born,
+                snap.diary.eaten,
+            );
+            draw_text(&hud, 10.0, 24.0, 24.0, ink);
 
-        if rats.is_empty() {
-            let msg = "The alley is quiet now...";
-            let size = measure_text(msg, None, 40, 1.0);
-            draw_text(msg, (sw - size.width) / 2.0, screen_height() / 2.0, 40.0, WHITE);
+            if snap.safe {
+                draw_text(&format!("STM on   Food: {}   (press B to break it)", snap.food_count), 10.0, 50.0, 22.0, ink);
+            } else {
+                // the ghost-food demo: this count can go below zero
+                draw_text(
+                    &format!("BROKEN MODE (no STM)   Food: {}   (press B to fix it)", snap.food_count),
+                    10.0,
+                    50.0,
+                    22.0,
+                    RED,
+                );
+            }
+            if !net.connected() {
+                draw_centered("Lost connection to the server, retrying...", 90.0, 28, ORANGE);
+            } else if snap.rats.is_empty() {
+                draw_centered("The alley is quiet now...", screen_height() / 2.0, 40, WHITE);
+            }
         }
 
         next_frame().await
