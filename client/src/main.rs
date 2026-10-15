@@ -135,6 +135,53 @@ fn draw_rat(tex: &Texture2D, c: &Rat, y: f32) {
     }
 }
 
+/// One spark of the death explosion. `ring` particles are the expanding shock wave.
+struct Particle {
+    pos: Vec2,
+    vel: Vec2,
+    life: f32,
+    max_life: f32,
+    size: f32,
+    color: Color,
+    ring: bool,
+}
+
+/// "Boom": a flash, an expanding ring and a burst of sparks flying up and out.
+fn spawn_boom(particles: &mut Vec<Particle>, at: Vec2) {
+    particles.push(Particle { pos: at, vel: Vec2::ZERO, life: 0.35, max_life: 0.35, size: 10.0, color: WHITE, ring: true });
+    let palette = [
+        Color::from_rgba(255, 220, 80, 255),
+        Color::from_rgba(255, 140, 40, 255),
+        Color::from_rgba(255, 80, 60, 255),
+        Color::from_rgba(120, 120, 130, 255), // smoke
+    ];
+    for _ in 0..24 {
+        let angle = rand::gen_range(0.0, std::f32::consts::TAU);
+        let speed = rand::gen_range(60.0, 260.0);
+        let life = rand::gen_range(0.4, 0.9);
+        particles.push(Particle {
+            pos: at,
+            vel: vec2(angle.cos() * speed, angle.sin() * speed - 80.0),
+            life,
+            max_life: life,
+            size: rand::gen_range(2.0, 5.0),
+            color: palette[rand::gen_range(0, palette.len())],
+            ring: false,
+        });
+    }
+}
+
+fn draw_particle(p: &Particle) {
+    let t = (p.life / p.max_life).clamp(0.0, 1.0); // 1 -> 0 as it fades
+    if p.ring {
+        let radius = p.size + (1.0 - t) * 55.0;
+        draw_circle(p.pos.x, p.pos.y, radius * 0.6, Color::new(1.0, 0.9, 0.6, 0.5 * t)); // flash
+        draw_circle_lines(p.pos.x, p.pos.y, radius, 3.0, Color::new(1.0, 1.0, 1.0, t));
+    } else {
+        draw_circle(p.pos.x, p.pos.y, p.size * (0.4 + 0.6 * t), Color::new(p.color.r, p.color.g, p.color.b, t));
+    }
+}
+
 fn draw_food(tex: &Texture2D, x: f32, y: f32) {
     let size = FOOD_PX * FOOD_SCALE;
     draw_texture_ex(
@@ -178,6 +225,7 @@ async fn main() {
         .map(|&(frac_x, tier)| Roof { frac_x, tier, owner: None })
         .collect();
 
+    let mut particles: Vec<Particle> = Vec::new();
     let mut night = 1u32;
     let mut clock = 0.0f32; // seconds into the current night or morning
     let mut morning = false;
@@ -278,11 +326,23 @@ async fn main() {
 
         // --- rats that starve leave the alley (and free their roof) ---
         for rat in rats.iter().filter(|c| c.hunger >= 100.0) {
-            if let State::Sleep(r) = rat.state {
-                roofs[r].owner = None;
-            }
+            let y = match rat.state {
+                State::Sleep(r) => {
+                    roofs[r].owner = None;
+                    roofs[r].rect().y
+                }
+                State::Wander => g,
+            };
+            spawn_boom(&mut particles, vec2(rat.x, y - CHAR_PX * CHAR_SCALE * 0.4));
         }
         rats.retain(|c| c.hunger < 100.0);
+
+        for p in particles.iter_mut() {
+            p.life -= dt;
+            p.vel.y += 500.0 * dt; // gravity
+            p.pos += p.vel * dt;
+        }
+        particles.retain(|p| p.life > 0.0);
 
         // --- draw ---
         // sky: deep night blue -> light gray morning
@@ -344,6 +404,9 @@ async fn main() {
                 State::Wander => g,
             };
             draw_rat(&char_tex, c, y);
+        }
+        for p in &particles {
+            draw_particle(p);
         }
 
         let hud = format!(

@@ -2,6 +2,28 @@
 
 A [macroquad](https://github.com/not-fl3/macroquad) game client, compiled to WebAssembly.
 
+## The story
+
+When the sun goes down in an old city, the stray rats come out. The market has closed, but scraps of food are left on the ground. A few warm roofs still hold the heat of the day, the best places to sleep. Every night, dozens of rats compete for food and warm spots, pups are born, and the big street dog patrols the alley. And sometimes a kind old lady comes out with a bowl of food (that's the player, clicking to drop food).
+
+The goal is to keep the rat colony alive through as many nights as possible.
+
+### How the story maps to Clojure
+
+- **Food scraps and food bowls are refs.** When two hungry rats jump on the same scrap at the same moment, a `dosync` transaction makes sure only one rat gets it. The other rat stays hungry and looks somewhere else.
+- **Warm roofs are refs too.** Each roof fits only one sleeping rat. Claiming a spot is a transaction, so two rats can never sleep in the same place.
+- **Each rat's mind is an agent.** Rats decide on their own in the background: look for food, nap, or run from the dog. Each rat has hunger, energy, and mood.
+- **The colony diary is an atom.** It counts rats alive, pups born, food eaten, and which night it is.
+- **The night cycle runs on core.async.** A loop ticks the world forward, changes night to morning (rats go hide and sleep), and sends snapshots to the browser.
+
+### The "broken mode" demo
+
+Turn off STM and use plain mutable arrays. Now you get ghost food: two rats eat the same scrap, both get full, and the food count goes negative. Two rats sleep on one roof inside each other. It's funny to watch, and it shows the problem clearly: without safe shared state, the world stops making sense. Turn STM back on and everything is correct again.
+
+### Rendering in macroquad
+
+The client draws a side-view alley from Kenney tiles: grass and dirt ground, hay-bale roofs, a greenhouse and pumpkins. Rats are pixel-art sprites that walk, hop and curl up to rest, tinted red when very hungry. Food scraps are snail shells. The background is dark blue with the greenhouse windows lit, and it fades to light gray at morning.
+
 ## Assets
 
 ```
